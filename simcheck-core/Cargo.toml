@@ -1,0 +1,13 @@
+[package]
+name = "simcheck-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "simcheck_core"
+# cdylib = the .pyd file Python loads; rlib lets `cargo test` run the unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# abi3: one build works on every Python from 3.9 up, including 3.15.
+pyo3 = { version = "0.23", features = ["abi3-py39"] }

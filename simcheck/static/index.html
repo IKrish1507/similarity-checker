@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simcheck</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --border: #e2e2dc; --accent: #2f5bd3; --accent-text: #ffffff;
+    --mark: #ffe08a; --mark-text: #1d1d1b; --bar: #e9e9e3; --danger: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --surface: #1f1f1d; --text: #ececea; --muted: #a0a09a;
+      --border: #34342f; --accent: #7f9ef5; --accent-text: #10131c;
+      --mark: #7a5c00; --mark-text: #fff6d6; --bar: #2c2c28; --danger: #f2b8b5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { margin: 0; font-size: 1.6rem; }
+  .sub { margin: 4px 0 24px; color: var(--muted); }
+  h2 { font-size: 1.05rem; margin: 32px 0 12px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, .file-btn { font: inherit; border: 1px solid var(--border); background: var(--surface);
+         color: var(--text); padding: 7px 14px; border-radius: 8px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .file-btn input { display: none; }
+  label.param { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  label.param input { width: 4.5em; font: inherit; padding: 5px 6px; border-radius: 6px;
+         border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+  .docs { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-top: 12px; }
+  .doc { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+  .doc-head { display: flex; gap: 6px; margin-bottom: 6px; }
+  .doc-head input { flex: 1; min-width: 0; font: inherit; font-weight: 600; border: none;
+         background: transparent; color: var(--text); padding: 2px 4px; }
+  .doc-head button { padding: 2px 8px; }
+  textarea { width: 100%; height: 160px; resize: vertical; font: 13px/1.45 ui-monospace, Consolas, monospace;
+         border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: var(--bg); color: var(--text); }
+  .status { color: var(--muted); margin-top: 12px; min-height: 1.5em; }
+  .status.error { color: var(--danger); }
+  .pairs { display: flex; flex-direction: column; gap: 6px; }
+  .pair { display: grid; grid-template-columns: 56px 1fr; gap: 12px; align-items: center; text-align: left;
+          padding: 10px 12px; width: 100%; }
+  .pair.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .pct { font-weight: 700; font-variant-numeric: tabular-nums; font-size: 1.1rem; }
+  .names { font-weight: 600; overflow-wrap: anywhere; }
+  .detail-line { color: var(--muted); font-size: .85rem; }
+  .bar { height: 5px; background: var(--bar); border-radius: 3px; margin-top: 5px; overflow: hidden; }
+  .bar span { display: block; height: 100%; background: var(--accent); }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+  .compare section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; min-width: 0; }
+  .compare h3 { margin: 0 0 8px; font-size: .95rem; overflow-wrap: anywhere; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 520px; overflow-y: auto; }
+  mark { background: var(--mark); color: var(--mark-text); border-radius: 2px; padding: 0 1px; }
+  @media (max-width: 700px) { .compare { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>simcheck</h1>
+  <p class="sub">Finds passages shared between documents using winnowing fingerprints. Runs entirely on this computer.</p>
+
+  <div class="toolbar">
+    <button id="add">Add document</button>
+    <label class="file-btn">Load .txt files<input id="files" type="file" accept=".txt,text/plain" multiple></label>
+    <button id="samples">Load samples</button>
+    <button id="clear">Clear</button>
+  </div>
+  <div class="docs" id="docs"></div>
+
+  <h2>Settings</h2>
+  <div class="toolbar">
+    <label class="param">k (words per k-gram) <input id="k" type="number" min="1" max="50" value="5"></label>
+    <label class="param">w (window) <input id="w" type="number" min="1" max="50" value="4"></label>
+    <button class="primary" id="run">Compare</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <div id="results" hidden>
+    <h2>Results</h2>
+    <div class="pairs" id="pairs"></div>
+    <div class="compare" id="compare" hidden>
+      <section><h3 id="a-name"></h3><div class="text" id="a-text"></div></section>
+      <section><h3 id="b-name"></h3><div class="text" id="b-text"></div></section>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const pct = (x) => Math.round(x * 100) + "%";
+
+function addDoc(name = "", text = "") {
+  const card = document.createElement("div");
+  card.className = "doc";
+  card.innerHTML = '<div class="doc-head"><input aria-label="Document name"><button title="Remove">×</button></div><textarea aria-label="Document text" placeholder="Paste text here"></textarea>';
+  const [nameInput, removeBtn] = card.querySelector(".doc-head").children;
+  nameInput.value = name || `Document ${$("docs").children.length + 1}`;
+  card.querySelector("textarea").value = text;
+  removeBtn.onclick = () => card.remove();
+  $("docs").append(card);
+}
+
+function readDocs() {
+  return [...$("docs").children].map((card) => ({
+    name: card.querySelector("input").value.trim() || "Untitled",
+    text: card.querySelector("textarea").value,
+  })).filter((d) => d.text.trim());
+}
+
+function setStatus(message, isError = false) {
+  $("status").textContent = message;
+  $("status").classList.toggle("error", isError);
+}
+
+// Build highlighted text with DOM nodes (never innerHTML), so document
+// contents are always shown as text, never run as code.
+function highlight(el, text, ranges) {
+  el.replaceChildren();
+  let pos = 0;
+  for (const [start, end] of ranges) {
+    if (start > pos) el.append(text.slice(pos, start));
+    const mark = document.createElement("mark");
+    mark.textContent = text.slice(start, end);
+    el.append(mark);
+    pos = end;
+  }
+  el.append(text.slice(pos));
+  el.querySelector("mark")?.scrollIntoView({ block: "nearest" });
+}
+
+function showPair(docs, pair, button) {
+  document.querySelectorAll(".pair").forEach((b) => b.classList.remove("active"));
+  button.classList.add("active");
+  $("compare").hidden = false;
+  $("a-name").textContent = `${docs[pair.a].name} — ${pct(pair.a_in_b)} found in the other`;
+  $("b-name").textContent = `${docs[pair.b].name} — ${pct(pair.b_in_a)} found in the other`;
+  highlight($("a-text"), docs[pair.a].text, pair.a_ranges);
+  highlight($("b-text"), docs[pair.b].text, pair.b_ranges);
+}
+
+function render(docs, result) {
+  $("results").hidden = false;
+  $("compare").hidden = true;
+  $("pairs").replaceChildren();
+  setStatus(`Engine: ${result.engine} · k=${result.k}, w=${result.w} · always catches copied runs of ${result.k + result.w - 1}+ words`);
+  for (const pair of result.pairs) {
+    const btn = document.createElement("button");
+    btn.className = "pair";
+    const score = document.createElement("span");
+    score.className = "pct";
+    score.textContent = pct(pair.score);
+    const info = document.createElement("span");
+    const names = document.createElement("div");
+    names.className = "names";
+    names.textContent = `${docs[pair.a].name} ↔ ${docs[pair.b].name}`;
+    const line = document.createElement("div");
+    line.className = "detail-line";
+    line.textContent = `${pct(pair.a_in_b)} / ${pct(pair.b_in_a)} contained · Jaccard ${pct(pair.jaccard)} · ${pair.a_ranges.length} shared passage(s)`;
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const fill = document.createElement("span");
+    fill.style.width = pct(pair.score);
+    bar.append(fill);
+    info.append(names, line, bar);
+    btn.append(score, info);
+    btn.onclick = () => showPair(docs, pair, btn);
+    $("pairs").append(btn);
+  }
+  const first = $("pairs").firstElementChild;
+  if (first && result.pairs[0].score > 0) first.click();
+}
+
+async function run() {
+  const docs = readDocs();
+  if (docs.length < 2) return setStatus("Add at least two documents with text.", true);
+  $("run").disabled = true;
+  setStatus("Comparing…");
+  try {
+    const response = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ documents: docs, k: Number($("k").value), w: Number($("w").value) }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    render(docs, data);
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, true);
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+$("add").onclick = () => addDoc();
+$("clear").onclick = () => { $("docs").replaceChildren(); $("results").hidden = true; setStatus(""); addDoc(); addDoc(); };
+$("run").onclick = run;
+$("samples").onclick = async () => {
+  const samples = await (await fetch("/api/samples")).json();
+  $("docs").replaceChildren();
+  samples.forEach((s) => addDoc(s.name, s.text));
+};
+$("files").onchange = async (event) => {
+  for (const file of event.target.files) addDoc(file.name, await file.text());
+  // Drop empty starter cards once real files arrive.
+  [...$("docs").children].forEach((c) => { if (!c.querySelector("textarea").value.trim()) c.remove(); });
+  event.target.value = "";
+};
+addDoc();
+addDoc();
+</script>
+</body>
+</html>

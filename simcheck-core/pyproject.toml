@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "simcheck-core"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[tool.maturin]
+module-name = "simcheck_core"
+# Only enabled when maturin builds the Python module, so `cargo test` still links.
+features = ["pyo3/extension-module"]
