@@ -30,10 +30,19 @@ Options: `-k` (words per k-gram), `-w` (window size), `--engine auto|rust|python
 python -m simcheck.web
 ```
 
-Open http://127.0.0.1:8000, paste text or load `.txt` files (or click
-**Load samples**), and press **Compare**. Click a result to see both documents
-side by side with the shared passages highlighted. The server only listens on
-this computer and uses nothing outside Python's standard library.
+Open http://127.0.0.1:8000. It works like a chat app:
+
+- Paste text or attach/drag in `.txt` files, then press **Ctrl+Enter**
+  (or click **Try the samples**).
+- Each check is saved in the sidebar, with search, delete, and
+  light/dark themes. Add more documents to a check at any time, and
+  they're compared with everything already in it.
+- Results show a plain-English summary, a similarity grid, a score ring
+  for each pair, and a side-by-side view with highlighted passages. You
+  can copy a summary or download the results as JSON.
+
+The server only listens on this computer and uses nothing outside Python's
+standard library. History is stored only in your browser.
 
 ## Tests
 

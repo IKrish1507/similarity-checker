@@ -8,15 +8,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import engine
 from .compare import Document, compare_all, shared_passages
 
-PAGE = Path(__file__).with_name("static") / "index.html"
+STATIC = Path(__file__).with_name("static")
 SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+
+# Only these files are served, so no request path can reach other files on disk.
+STATIC_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/static/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
 
 MAX_BODY_BYTES = 5 * 1024 * 1024  # refuse uploads bigger than 5 MB
 MAX_DOCUMENTS = 50
@@ -47,6 +56,7 @@ def analyze(payload: object) -> dict:
     k = _int_param(payload, "k", 5)
     w = _int_param(payload, "w", 4)
 
+    started = time.perf_counter()
     engine_name, impl = engine.resolve("auto")
     docs = [Document.from_text(d["name"], d["text"], impl.fingerprint, k, w) for d in raw_docs]
     index = {id(doc): i for i, doc in enumerate(docs)}
@@ -54,10 +64,12 @@ def analyze(payload: object) -> dict:
     def ranges(doc: Document, shared: frozenset[int]) -> list[tuple[int, int]]:
         return [doc.char_range(s, e) for s, e in shared_passages(doc, shared, k)]
 
+    pairs = compare_all(docs)
     return {
         "engine": engine_name,
         "k": k,
         "w": w,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
         "pairs": [
             {
                 "a": index[id(m.a)],
@@ -69,7 +81,7 @@ def analyze(payload: object) -> dict:
                 "a_ranges": ranges(m.a, m.shared),
                 "b_ranges": ranges(m.b, m.shared),
             }
-            for m in compare_all(docs)
+            for m in pairs
         ],
     }
 
@@ -89,6 +101,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-cache")  # always pick up edited files
         self.end_headers()
         self.wfile.write(body)
 
@@ -104,16 +117,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._from_this_computer():
             return self._json(HTTPStatus.FORBIDDEN, {"error": "unexpected Host header"})
-        if self.path in ("/", "/index.html"):
-            return self._send(HTTPStatus.OK, PAGE.read_bytes(), "text/html; charset=utf-8")
-        if self.path == "/api/samples":
+        path = urlsplit(self.path).path  # ignore any ?query
+        if path in STATIC_FILES:
+            name, content_type = STATIC_FILES[path]
+            return self._send(HTTPStatus.OK, (STATIC / name).read_bytes(), content_type)
+        if path == "/api/samples":
             return self._json(HTTPStatus.OK, load_samples())
+        if path == "/api/info":
+            name, _ = engine.resolve("auto")
+            return self._json(HTTPStatus.OK, {"engine": name, "max_documents": MAX_DOCUMENTS,
+                                              "max_body_bytes": MAX_BODY_BYTES, "max_param": MAX_PARAM})
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:
         if not self._from_this_computer():
             return self._json(HTTPStatus.FORBIDDEN, {"error": "unexpected Host header"})
-        if self.path != "/api/compare":
+        if urlsplit(self.path).path != "/api/compare":
             return self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         try:
             length = int(self.headers.get("Content-Length", ""))

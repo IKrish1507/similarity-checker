@@ -21,7 +21,7 @@ simcheck/            Python package (the program)
   compare.py         similarity scores and shared passages
   cli.py             command line interface
   web.py             local web server (python -m simcheck.web)
-  static/index.html  the web page
+  static/            the web app: index.html, app.css, app.js
   __main__.py        lets you run `python -m simcheck`
 simcheck-core/       Rust crate, compiled into a Python module
   src/lib.rs         the same fingerprint algorithm, in Rust
@@ -160,9 +160,15 @@ Built on Python's standard `http.server`, so there's nothing to install.
   between 1 and 50), fingerprints the documents and returns each pair's
   scores plus **character ranges** to highlight in both documents.
   Anything invalid raises `ValueError`, which becomes an HTTP 400 error.
-- **`Handler`** answers three addresses:
-  `GET /` (the page), `GET /api/samples` (the sample documents) and
-  `POST /api/compare` (runs `analyze`).
+- **`Handler`** answers these addresses:
+  - `GET /`, `/static/app.css`, `/static/app.js`: the page files. Only the
+    files listed in `STATIC_FILES` are served, so a request like
+    `/static/../../secret.txt` can't read other files on disk ("path
+    traversal").
+  - `GET /api/info`: which engine is active, plus the limits.
+  - `GET /api/samples`: the sample documents.
+  - `POST /api/compare`: runs `analyze`, which also reports how long the
+    comparison took (`elapsed_ms`).
 - **Safety limits:**
   - It listens on `127.0.0.1` only, so other computers on your Wi-Fi can't
     reach it.
@@ -174,25 +180,83 @@ Built on Python's standard `http.server`, so there's nothing to install.
 - `ThreadingHTTPServer` handles each request on its own thread, so one
   slow comparison doesn't freeze the page.
 
-## simcheck/static/index.html (the page)
+## The web app (simcheck/static/)
 
-Plain HTML, CSS and JavaScript, with no frameworks.
+A chat-style interface in plain HTML, CSS and JavaScript, with no frameworks
+and no build step. Each **check** works like a chat conversation: your
+message lists the documents you added, and the reply shows the results. You
+can keep adding documents to a check, and each new one is compared with
+everything already there.
 
-- **Document cards:** each card has a name and a text box. "Load .txt
-  files" reads files in the browser with `file.text()`. They are only sent
-  to your own local server.
-- **`run()`** sends the documents to `/api/compare` with `fetch` and
-  shows any error message from the server.
-- **`render()`** lists every pair with its score bar. Clicking a pair
-  calls **`showPair()`**, which shows both documents side by side.
-- **`highlight()`** builds the highlighted text from DOM nodes: plain
-  text pieces plus `<mark>` elements whose `textContent` is set. It never
-  uses `innerHTML` with document text, so a document containing
-  `<script>` is displayed as text instead of running. That bug class is
-  called **XSS (cross-site scripting)**, and avoiding it is worth pointing
-  out in interviews.
-- Colours are CSS variables with a dark-mode set under
-  `prefers-color-scheme: dark`.
+### index.html: the structure
+- **Sidebar:** "New check", search box, history list, a settings panel
+  (k and w sliders) and the theme switch (system / light / dark).
+- **Main area:** a top bar (title, engine badge, help button), the thread,
+  and the composer.
+- A tiny script in `<head>` applies the saved theme *before* the page
+  draws, so a dark-mode user never sees a white flash.
+- `<span data-icon="...">` placeholders are swapped for SVG icons on start-up.
+
+### app.css: the look
+- **Design tokens:** every colour is a CSS variable on `:root`. Dark mode
+  redefines them in two places: for "system" (`prefers-color-scheme`)
+  and when the user picks dark (`[data-theme="dark"]`). Components only
+  use the variables, so one change re-themes everything.
+- **Layout:** the sidebar and main area are a flex row filling the screen
+  (`100dvh`). Collapsing the sidebar slides it out with a negative margin.
+  Under 800px wide it becomes an overlay drawer with a dimmed backdrop.
+- **Score ring:** a `conic-gradient` circle filled to the score, with a
+  smaller circle on top to make a ring. No images or chart library needed.
+- **Similarity grid cells** mix the accent colour into the background
+  in proportion to the score, using `color-mix()`.
+- `[hidden] { display: none !important; }` makes sure the `hidden`
+  attribute always wins over class rules like `display: flex`.
+- Animations are switched off for users who ask their system for
+  reduced motion.
+
+### app.js: the behaviour
+Organised top to bottom:
+
+1. **Helpers.** `h(tag, props, ...children)` builds elements. Strings
+   always become *text nodes*, never HTML, so a document containing
+   `<script>` is shown as text instead of running. That bug class is called
+   **XSS (cross-site scripting)**, and avoiding it is worth mentioning in
+   interviews. Icons are the only `innerHTML`, and they come from fixed
+   strings in the file.
+2. **Storage.** History, settings, theme and sidebar state are saved in
+   the browser's `localStorage`. Every read and write is wrapped in
+   `try/catch`, because storage can be blocked (private windows) or full.
+   Loaded data is checked before use, and history keeps the newest 40 checks.
+3. **State.** One `state` object holds the checks, the open check,
+   documents waiting in the composer, settings and theme. Everything on
+   screen is drawn from it.
+4. **Sidebar.** `renderHistory()` filters by the search box and groups
+   checks into Today / Yesterday / Previous 7 days / Older.
+5. **Thread.** `render()` redraws the open check. With no check open, it
+   shows the welcome screen with the composer in the middle and three
+   suggestion cards. `renderTurn()` draws one request/result pair.
+   `renderResult()` writes a plain-English summary, then the similarity
+   grid (3+ documents), a card per overlapping pair, and the pairs with no
+   overlap folded away.
+6. **Pair cards.** Each card shows a score ring, a High / Medium / Low
+   badge (≥40% / ≥15% / above 0) and the scores. "Compare side by side"
+   builds the viewer: both texts with `<mark>` highlights, plus
+   previous/next buttons that scroll each column to its next passage
+   (`focusMark`).
+7. **Copy and download.** "Copy summary" puts a short text report on the
+   clipboard. "Download JSON" saves the scores and passages as a file,
+   created in the browser with a `Blob`.
+8. **Composer.** Pasted text becomes a document named after its first
+   words. `.txt` files come from the paperclip button or drag-and-drop
+   (files over 2 MB are refused). Documents appear as chips you can remove
+   or rename (double-click).
+9. **Running a check.** `send()` adds the new documents to the open check
+   (or starts a new one), records a *turn* with the current k and w, and
+   `runTurn()` posts all of the check's documents to `/api/compare`. Errors
+   show in the thread with a "Try again" button, and a dropped connection
+   gets a hint to restart the server.
+10. **Events.** Ctrl+Enter compares, Ctrl+Shift+O starts a new check,
+    Escape closes panels, and drag-and-drop works anywhere on the page.
 
 ---
 
