@@ -44,6 +44,29 @@ Open http://127.0.0.1:8000. It works like a chat app:
 The server only listens on this computer and uses nothing outside Python's
 standard library. History is stored only in your browser.
 
+The mode pill in the composer switches between three checks:
+
+| Mode | What it does | Runs where |
+|---|---|---|
+| **Compare** | Shared passages between 2+ documents | This computer |
+| **AI check** | Estimates AI-style writing patterns in one document, with each signal explained. **An estimate, not proof**: formal and non-native English writing can score high | This computer |
+| **Web check** | Searches the web for up to 8 distinctive phrases, downloads matching pages and fingerprints them | Phrases go to Brave Search |
+
+### Enabling web check
+
+Web check needs a [Brave Search API](https://brave.com/search/api/) key
+(the plan includes free monthly credit; sign-up needs a card). Save it as
+an environment variable, then open a new terminal and restart the server:
+
+```bash
+setx BRAVE_SEARCH_API_KEY "your-key"
+```
+
+The key is read from the environment and never stored in the code, the
+browser or the repository. Pages behind logins or paywalls, PDFs, and
+private collections (like other students' submissions) can't be checked,
+so a low result doesn't guarantee originality.
+
 ## Tests
 
 ```bash

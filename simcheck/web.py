@@ -8,17 +8,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import engine
+from .aicheck import ai_check
 from .compare import Document, compare_all, shared_passages
+from .webcheck import WebCheckError, brave_search, fetch_page_text, web_check
 
 STATIC = Path(__file__).with_name("static")
 SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+SAMPLE_SETS = {"compare": SAMPLES, "ai": SAMPLES / "ai-check"}
+
+# The Brave Search key comes from the environment, so it is never stored in
+# the code, the browser or the repository.
+BRAVE_KEY_VAR = "BRAVE_SEARCH_API_KEY"
 
 # Only these files are served, so no request path can reach other files on disk.
 STATIC_FILES = {
@@ -30,6 +38,16 @@ STATIC_FILES = {
 MAX_BODY_BYTES = 5 * 1024 * 1024  # refuse uploads bigger than 5 MB
 MAX_DOCUMENTS = 50
 MAX_PARAM = 50  # upper limit for k and w
+
+
+class NotConfigured(Exception):
+    """A feature needs setup (such as an API key) before it can run."""
+
+
+def _text_param(payload: object) -> str:
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str) or not payload["text"].strip():
+        raise ValueError("send a JSON object with a non-empty 'text'")
+    return payload["text"]
 
 
 def _int_param(payload: dict, key: str, default: int) -> int:
@@ -86,11 +104,46 @@ def analyze(payload: object) -> dict:
     }
 
 
-def load_samples() -> list[dict]:
+def ai_check_request(payload: object) -> dict:
+    return ai_check(_text_param(payload))
+
+
+def web_search_configured() -> bool:
+    return bool(os.environ.get(BRAVE_KEY_VAR, "").strip())
+
+
+def web_check_request(payload: object) -> dict:
+    text = _text_param(payload)
+    if not web_search_configured():
+        raise NotConfigured(
+            f"Web check needs a Brave Search API key. Set {BRAVE_KEY_VAR} and restart the server "
+            "(see 'How it works')."
+        )
+    engine_name, impl = engine.resolve("auto")
+    result = web_check(
+        text,
+        search=brave_search(os.environ[BRAVE_KEY_VAR].strip()),
+        fetch=fetch_page_text,
+        fingerprint=impl.fingerprint,
+    )
+    return {"engine": engine_name, **result}
+
+
+def load_samples(sample_set: str = "compare") -> list[dict]:
+    folder = SAMPLE_SETS.get(sample_set)
+    if folder is None:
+        raise ValueError(f"unknown sample set {sample_set!r}")
     return [
         {"name": p.name, "text": p.read_text(encoding="utf-8", errors="replace")}
-        for p in sorted(SAMPLES.glob("*.txt"))
+        for p in sorted(folder.glob("*.txt"))
     ]
+
+
+POST_ROUTES = {
+    "/api/compare": analyze,
+    "/api/ai-check": ai_check_request,
+    "/api/web-check": web_check_request,
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -117,22 +170,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._from_this_computer():
             return self._json(HTTPStatus.FORBIDDEN, {"error": "unexpected Host header"})
-        path = urlsplit(self.path).path  # ignore any ?query
-        if path in STATIC_FILES:
-            name, content_type = STATIC_FILES[path]
+        url = urlsplit(self.path)
+        if url.path in STATIC_FILES:
+            name, content_type = STATIC_FILES[url.path]
             return self._send(HTTPStatus.OK, (STATIC / name).read_bytes(), content_type)
-        if path == "/api/samples":
-            return self._json(HTTPStatus.OK, load_samples())
-        if path == "/api/info":
+        if url.path == "/api/samples":
+            sample_set = parse_qs(url.query).get("set", ["compare"])[0]
+            try:
+                return self._json(HTTPStatus.OK, load_samples(sample_set))
+            except ValueError as err:
+                return self._json(HTTPStatus.NOT_FOUND, {"error": str(err)})
+        if url.path == "/api/info":
             name, _ = engine.resolve("auto")
-            return self._json(HTTPStatus.OK, {"engine": name, "max_documents": MAX_DOCUMENTS,
-                                              "max_body_bytes": MAX_BODY_BYTES, "max_param": MAX_PARAM})
+            return self._json(HTTPStatus.OK, {
+                "engine": name, "max_documents": MAX_DOCUMENTS, "max_body_bytes": MAX_BODY_BYTES,
+                "max_param": MAX_PARAM, "web_search": web_search_configured(),
+            })
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:
         if not self._from_this_computer():
             return self._json(HTTPStatus.FORBIDDEN, {"error": "unexpected Host header"})
-        if urlsplit(self.path).path != "/api/compare":
+        handler = POST_ROUTES.get(urlsplit(self.path).path)
+        if handler is None:
             return self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         try:
             length = int(self.headers.get("Content-Length", ""))
@@ -141,7 +201,11 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 <= length <= MAX_BODY_BYTES:
             return self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request too large (5 MB max)"})
         try:
-            result = analyze(json.loads(self.rfile.read(length)))
+            result = handler(json.loads(self.rfile.read(length)))
+        except NotConfigured as err:
+            return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(err)})
+        except WebCheckError as err:
+            return self._json(HTTPStatus.BAD_GATEWAY, {"error": str(err)})
         except (ValueError, UnicodeDecodeError) as err:  # JSONDecodeError is a ValueError
             return self._json(HTTPStatus.BAD_REQUEST, {"error": str(err)})
         self._json(HTTPStatus.OK, result)
@@ -154,6 +218,7 @@ def main(argv: list[str] | None = None) -> None:
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"simcheck running at http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
+    print(f"Web check: {'enabled' if web_search_configured() else f'disabled (set {BRAVE_KEY_VAR} to enable)'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

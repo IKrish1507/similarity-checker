@@ -20,6 +20,9 @@ simcheck/            Python package (the program)
   engine.py          picks the Rust core or the Python fallback
   compare.py         similarity scores and shared passages
   cli.py             command line interface
+  sentences.py       sentence splitting shared by the checks below
+  aicheck.py         AI-writing pattern estimate
+  webcheck.py        web source check (search, safe download, compare)
   web.py             local web server (python -m simcheck.web)
   static/            the web app: index.html, app.css, app.js
   __main__.py        lets you run `python -m simcheck`
@@ -150,6 +153,97 @@ into it, so many small hits become one readable passage.
 
 ---
 
+## simcheck/sentences.py
+
+`split_sentences(text)` returns the character range of every sentence: a
+run of text up to `.`, `!`, `?` or a line break, plus any closing quote or
+bracket. Positions are kept so sentences can be highlighted later.
+It's deliberately simple, so "e.g." and "Dr." end a sentence early, which is
+fine for the estimates it's used for. `words(text)` counts words for
+statistics, keeping "don't" and "well-known" whole.
+
+---
+
+## simcheck/aicheck.py (AI-writing check)
+
+**What it is:** a transparent heuristic, not a trained AI model. It measures
+five patterns that AI assistants produce more often than most people do:
+
+| Signal | Weight | What's measured | Scored 0 → 1 between |
+|---|---|---|---|
+| Even sentence lengths | 35% | standard deviation ÷ mean of sentence lengths ("coefficient of variation") | 0.65 → 0.30 |
+| AI-typical wording | 30% | hits from the `AI_PHRASES` list per 1,000 words | 0 → 8 |
+| Stock transitions | 15% | share of sentences starting "Furthermore", "Moreover"… | 5% → 25% |
+| Three-part lists | 10% | share of sentences with an "X, Y, and Z" list | 5% → 30% |
+| Em-dash use | 10% | em dashes per 1,000 words | 0 → 6 |
+
+- **`_scale(value, low, high)`** maps a measurement onto 0–1 in a straight
+  line, clamped at both ends. Each signal's score is multiplied by its
+  weight and the results are added up into a score out of 100.
+- **Bands:** under 30 "Few", 30–59 "Some", 60+ "Many" AI-style patterns.
+- **Flagged sentences** list the reasons they were flagged (which words,
+  which opener), so the result can be checked by a person.
+- **Guards:** below 150 words or 5 real sentences it returns no score,
+  because statistics on tiny samples are meaningless.
+- **Regexes:** the phrase list is compiled into one regex, longest
+  phrases first, so "it is important to note" wins over shorter overlaps.
+  `(?<![\w-])` and `(?![\w-])` act like word boundaries that also respect
+  hyphens.
+
+**Limits (shown in the UI as well):** this cannot prove anything. Formal
+academic writing and non-native English writers often score high, edited
+AI text can score low, and the thresholds were chosen by hand, not
+measured on a labelled dataset. Commercial detectors have the same
+fundamental problem. On the two samples in `samples/ai-check/` (both written
+for this project) the AI-style text scores 90 and the casual human text
+scores 5. That shows the signals behave as designed; it is **not** an
+accuracy measurement.
+
+---
+
+## simcheck/webcheck.py (web source check)
+
+How real plagiarism checkers search the web, in four steps:
+
+1. **`pick_queries`**: take the first 14 words of each long sentence (10+
+   words), score each candidate by how many long, uncommon words it has,
+   split the document into 8 equal parts and pick the best candidate from
+   each. Quoted phrases make the search engine look for that exact wording.
+2. **`brave_search(api_key)`** returns a search function that calls the
+   Brave Search API. Errors become `WebCheckError` with plain messages: a
+   wrong key, an exhausted free credit (HTTP 429) or no connection. The key
+   is sent only in the request header and never appears in messages.
+   Searches are spaced 1.1 s apart because Brave's free plan allows about
+   one request per second.
+3. **`fetch_page_text`** downloads each page (up to 12, those returned for
+   the most phrases first, 6 at a time in parallel) with a 10 s timeout
+   and a 2 MB cap, accepts only HTML or plain text, and extracts the
+   readable text with `_TextExtractor`, which skips scripts, styles,
+   navigation and footers.
+4. **`web_check`** fingerprints every page and compares it with the
+   document. Each source gets "how much of your document is on this page"
+   plus highlight ranges, and the overall figure is the share of the
+   document's fingerprints found on *any* page. Pages that fail to download
+   are listed with the reason instead of failing the whole check.
+
+**SSRF protection (`check_public_url`).** The server downloads URLs that
+come from search results, which we don't control. A malicious result could
+point at `http://192.168.1.1/` (your router) or a cloud metadata address
+(`169.254.169.254`), making your computer fetch something private. That is
+called **server-side request forgery (SSRF)**. So every URL, and every
+redirect hop (`_CheckedRedirects`), must be http(s) and resolve only to
+public IP addresses (`ipaddress.ip_address(...).is_global`). Remaining
+gap: the address is checked, then connected to separately, so a hostile DNS
+server could change the answer in between ("DNS rebinding"). Closing that
+needs connecting to the exact checked IP, which is planned for the final
+version.
+
+**Testing without a key:** `web_check` takes `search` and `fetch` as
+parameters ("dependency injection"), so the tests pass fake functions and
+check the whole pipeline without touching the internet.
+
+---
+
 ## simcheck/web.py (local web server)
 
 Built on Python's standard `http.server`, so there's nothing to install.
@@ -165,10 +259,17 @@ Built on Python's standard `http.server`, so there's nothing to install.
     files listed in `STATIC_FILES` are served, so a request like
     `/static/../../secret.txt` can't read other files on disk ("path
     traversal").
-  - `GET /api/info`: which engine is active, plus the limits.
-  - `GET /api/samples`: the sample documents.
+  - `GET /api/info`: which engine is active, the limits, and whether
+    web search is set up.
+  - `GET /api/samples` (`?set=ai` for the AI-check samples).
   - `POST /api/compare`: runs `analyze`, which also reports how long the
     comparison took (`elapsed_ms`).
+  - `POST /api/ai-check` and `POST /api/web-check`: take `{"text": ...}`.
+  POST routes are looked up in the `POST_ROUTES` table. Errors map to
+  HTTP codes: bad input → 400, web check without a key → 503
+  (`NotConfigured`), search or download failure → 502 (`WebCheckError`).
+- **The Brave key** is read from the `BRAVE_SEARCH_API_KEY` environment
+  variable, so it is never stored in code, in the browser or on GitHub.
 - **Safety limits:**
   - It listens on `127.0.0.1` only, so other computers on your Wi-Fi can't
     reach it.
@@ -250,12 +351,28 @@ Organised top to bottom:
    words. `.txt` files come from the paperclip button or drag-and-drop
    (files over 2 MB are refused). Documents appear as chips you can remove
    or rename (double-click).
-9. **Running a check.** `send()` adds the new documents to the open check
-   (or starts a new one), records a *turn* with the current k and w, and
-   `runTurn()` posts all of the check's documents to `/api/compare`. Errors
-   show in the thread with a "Try again" button, and a dropped connection
-   gets a hint to restart the server.
-10. **Events.** Ctrl+Enter compares, Ctrl+Shift+O starts a new check,
+9. **Modes.** The pill next to the paperclip switches between Compare,
+   AI check and Web check (`MODES`, `setMode`, `toggleModeMenu`). AI and
+   web checks take exactly one document. Web check shows "needs setup" and
+   opens the setup steps until the server reports a key.
+10. **Running a check.** `send()` adds the new documents to the open check
+   (or starts a new one) and records a *turn* with its `kind`. `runTurn()`
+   posts to the matching endpoint. Errors show in the thread with a
+   "Try again" button, and a dropped connection gets a hint to restart the
+   server. Checks saved before modes existed have no `kind` and are
+   treated as comparisons.
+11. **AI result** (`renderAiResult`): score ring and band, the "not proof"
+    notice *before* any detail, a row per signal with a meter and
+    explanation, and the text with flagged sentences highlighted. Hovering
+    a highlight shows why it was flagged.
+12. **Web result** (`renderWebResult`, `sourceCard`): summary, one card per
+    matching page with a link and "Show matches", plus folded sections for
+    all matches, the exact phrases searched, and pages that couldn't be
+    read. Links pass through `safeLink`, so only `http(s)` URLs become
+    links. A `javascript:` URL in a search result can't run code, and
+    `rel="noopener noreferrer"` stops the opened page from controlling
+    this one.
+13. **Events.** Ctrl+Enter compares, Ctrl+Shift+O starts a new check,
     Escape closes panels, and drag-and-drop works anywhere on the page.
 
 ---

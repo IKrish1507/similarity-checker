@@ -85,6 +85,12 @@
               <span data-icon="clip"></span>
               <input id="files" type="file" accept=".txt,.md,text/plain" multiple hidden>
             </label>
+            <div class="mode-wrap">
+              <button class="mode-btn" id="mode-btn" aria-haspopup="menu" aria-expanded="false" title="Choose what to check">
+                <span id="mode-icon"></span><span id="mode-label">Compare</span><span data-icon="chevron"></span>
+              </button>
+              <div class="mode-menu" id="mode-menu" role="menu" hidden></div>
+            </div>
             <button class="pill-btn" id="add-text" hidden><span data-icon="plus"></span>Add as document</button>
             <span class="doc-count" id="doc-count"></span>
             <button class="send" id="send" title="Compare (Ctrl+Enter)" aria-label="Compare" disabled><span data-icon="arrowUp"></span></button>

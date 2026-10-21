@@ -48,6 +48,32 @@ const ICONS = {
   down: '<path d="m6 9 6 6 6-6"/>',
   book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M8 7h7"/>',
   retry: '<path d="M4 12a8 8 0 0 1 14-5.3L20 9M20 4v5h-5M20 12a8 8 0 0 1-14 5.3L4 15M4 20v-5h5"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  alert: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 4 2.6 17.5A2 2 0 0 0 4.3 20.5h15.4a2 2 0 0 0 1.7-3L13.7 4a2 2 0 0 0-3.4 0z"/>',
+  external: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+};
+
+// The three kinds of check the composer can run.
+const MODES = {
+  compare: {
+    icon: "columns", label: "Compare", title: "Compare documents",
+    text: "Find passages shared between two or more documents.",
+    placeholder: "Paste a document here, or attach .txt files…",
+    thinking: "Comparing documents…",
+  },
+  ai: {
+    icon: "sparkle", label: "AI check", title: "AI-writing check",
+    text: "Estimate AI-style writing patterns in one document. Not proof.",
+    placeholder: "Paste the document to check for AI-style writing…",
+    thinking: "Looking for AI-style patterns…",
+  },
+  web: {
+    icon: "globe", label: "Web check", title: "Web source check",
+    text: "Search the web for pages that contain passages from one document.",
+    placeholder: "Paste the document to search the web for…",
+    thinking: "Searching the web and reading pages… this can take up to a minute",
+  },
 };
 
 function icon(name) {
@@ -118,6 +144,8 @@ const state = {
   settings: loadSettings(),
   theme: store.get(KEYS.theme, "system"),
   engine: null,
+  webSearch: false, // whether the server has a search API key
+  mode: "compare",
   busy: false,
   pasteCount: 0,
   storageWarned: false,
@@ -133,6 +161,7 @@ const el = {
   settings: $("#settings"), settingsBtn: $("#settings-btn"), k: $("#k"), w: $("#w"),
   kVal: $("#k-val"), wVal: $("#w-val"), guarantee: $("#guarantee"), engineLine: $("#engine-line"),
   dialog: $("#dialog"), dialogTitle: $("#dialog-title"), dialogBody: $("#dialog-body"), toasts: $("#toasts"),
+  modeBtn: $("#mode-btn"), modeMenu: $("#mode-menu"), modeIcon: $("#mode-icon"), modeLabel: $("#mode-label"),
 };
 
 /* ============================================================
@@ -187,6 +216,40 @@ function renderSettings() {
     `Any copied run of ${k + w - 1}+ words is always caught. ` +
     "Smaller numbers find shorter matches but also flag common phrases.";
   el.engineLine.textContent = state.engine ? `Engine: ${state.engine}` : "Engine: unknown";
+}
+
+/* ============================================================
+   Mode menu: Compare / AI check / Web check
+   ============================================================ */
+
+function setMode(mode) {
+  state.mode = MODES[mode] ? mode : "compare";
+  const m = MODES[state.mode];
+  el.modeIcon.replaceChildren(icon(m.icon));
+  el.modeLabel.textContent = m.label;
+  el.modeBtn.className = `mode-btn ${state.mode}`;
+  el.input.placeholder = m.placeholder;
+  toggleModeMenu(false);
+  updateComposer();
+}
+
+function toggleModeMenu(open = el.modeMenu.hidden) {
+  if (open) {
+    el.modeMenu.replaceChildren(...Object.entries(MODES).map(([key, m]) => {
+      const needsSetup = key === "web" && !state.webSearch;
+      return h("button", {
+        class: "mode-item", role: "menuitemradio", "aria-checked": String(key === state.mode),
+        "aria-disabled": needsSetup ? "true" : null,
+        onclick: () => (needsSetup ? showHelp("web") : setMode(key)),
+      },
+      icon(m.icon),
+      h("span", {}, h("b", {}, m.title), h("span", {}, needsSetup ? "Needs a Brave Search API key. Click for setup steps." : m.text)),
+      key === state.mode ? h("span", { class: "tick" }, icon("check")) : h("span"));
+    }));
+  }
+  el.modeMenu.hidden = !open;
+  el.modeBtn.setAttribute("aria-expanded", String(open));
+  if (open) el.modeMenu.querySelector(".mode-item")?.focus();
 }
 
 /* ============================================================
@@ -298,12 +361,13 @@ function renderHero() {
   slot.append(el.composerWrap); // the composer sits in the middle until the first check
   return h("div", { class: "hero" },
     h("h2", {}, icon("logo"), "What should we compare?"),
-    h("p", { class: "lead" }, "Paste or attach two or more documents to find the passages they share."),
+    h("p", { class: "lead" }, "Compare documents, estimate AI-style writing, or search the web for matching sources."),
     slot,
     h("div", { class: "suggestions" },
-      suggestion("sparkle", "Try the samples", "Three short documents, one partly copied", runSamples),
+      suggestion("columns", "Try a comparison", "Three short documents, one partly copied", runSamples),
+      suggestion("sparkle", "Try an AI check", "A sample written in typical AI style", runAiSample),
       suggestion("clip", "Attach .txt files", "Or drag them anywhere on this page", () => el.files.click()),
-      suggestion("book", "How it works", "Fingerprints, winnowing and scores", showHelp),
+      suggestion("book", "How it works", "What each check measures, and its limits", () => showHelp()),
     ),
   );
 }
@@ -326,23 +390,28 @@ function previewDoc(doc) {
 }
 
 function renderTurn(conv, turn) {
+  const kind = MODES[turn.kind] ? turn.kind : "compare"; // checks saved before modes existed are comparisons
   const docs = conv.documents.slice(0, turn.docCount);
   const added = docs.slice(turn.docCount - turn.addedCount);
-  const label = turn.docCount === turn.addedCount
-    ? `Compare ${plural(added.length, "document")}`
-    : `Add ${plural(added.length, "document")} and compare with the ${turn.docCount - turn.addedCount} already here`;
+  let label;
+  if (kind === "ai") label = "AI-writing check";
+  else if (kind === "web") label = "Web source check";
+  else if (turn.docCount === turn.addedCount) label = `Compare ${plural(added.length, "document")} · k=${turn.k}, w=${turn.w}`;
+  else label = `Add ${plural(added.length, "document")} and compare with the ${turn.docCount - turn.addedCount} already here · k=${turn.k}, w=${turn.w}`;
 
   let body;
-  if (turn.result) body = renderResult(docs, turn.result);
+  if (turn.result && kind === "ai") body = renderAiResult(added[0], turn.result);
+  else if (turn.result && kind === "web") body = renderWebResult(added[0], turn.result);
+  else if (turn.result) body = renderResult(docs, turn.result);
   else if (turn.error) body = h("div", { class: "error-box" },
     h("p", {}, turn.error),
     h("button", { class: "ghost-btn", onclick: () => runTurn(conv, turn) }, icon("retry"), "Try again"));
-  else body = h("div", { class: "thinking" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), "Comparing documents…");
+  else body = h("div", { class: "thinking" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), MODES[kind].thinking);
 
   return h("section", { class: "turn" },
     h("div", { class: "user-msg" },
       h("div", { class: "user-bubble" },
-        h("div", { class: "bubble-label" }, `${label} · k=${turn.k}, w=${turn.w}`),
+        h("div", { class: "bubble-label" }, label),
         h("div", { class: "chips" }, added.map(docChip)))),
     h("div", { class: "assistant-msg" },
       h("div", { class: "avatar", "aria-hidden": "true" }, icon("logo")),
@@ -496,16 +565,129 @@ function viewerColumn(doc, note, ranges) {
   };
 }
 
-/** Fill `container` with text, wrapping each [start, end) range in <mark>. */
-function highlight(container, text, ranges) {
+/**
+ * Fill `container` with text, wrapping each [start, end) range in <mark>.
+ * `decorate(mark, index)` can add a class or tooltip to each mark.
+ */
+function highlight(container, text, ranges, decorate) {
   container.replaceChildren();
   let pos = 0;
-  for (const [start, end] of ranges) {
+  ranges.forEach(([start, end], i) => {
+    if (start < pos) return; // ranges are sorted and never overlap; skip anything malformed
     if (start > pos) container.append(text.slice(pos, start));
-    container.append(h("mark", {}, text.slice(start, end)));
+    const mark = h("mark", {}, text.slice(start, end));
+    decorate?.(mark, i);
+    container.append(mark);
     pos = end;
-  }
+  });
   container.append(text.slice(pos));
+}
+
+function ring(fraction, color, label = pct(fraction)) {
+  return h("div", { class: "ring", style: `--p:${Math.round(fraction * 100)};--c:var(--${color})` }, h("span", {}, label));
+}
+
+/* ---------- AI-writing check result ---------- */
+
+function renderAiResult(doc, r) {
+  const notProof = h("div", { class: "notice" }, icon("alert"),
+    h("p", {}, h("b", {}, "This is an estimate, not proof. "),
+      "It measures writing patterns common in AI text. Careful human writers, formal academic style and " +
+      "non-native English writers can score high, and edited AI text can score low. Don't use it as " +
+      "evidence about anyone's work, including yours."));
+
+  if (!r.enough_text) {
+    return h("div", {},
+      h("p", { class: "summary" }, `This document is too short to estimate. It has ${r.words} words, and the check needs at least ${r.min_words} in five or more sentences.`),
+      notProof);
+  }
+
+  const color = r.score >= 60 ? "high" : r.score >= 30 ? "medium" : "low";
+  const view = h("div", { class: "doc-view", tabindex: "0" });
+  highlight(view, doc.text, r.flagged.map((f) => [f.start, f.end]), (mark, i) => {
+    mark.classList.add("ai");
+    mark.title = r.flagged[i].reasons.join("\n");
+  });
+
+  return h("div", {},
+    h("div", { class: "score-head" },
+      ring(r.score / 100, color, String(r.score)),
+      h("div", {},
+        h("h3", {}, r.band),
+        h("p", {}, `AI-style score ${r.score} out of 100 · ${r.words.toLocaleString()} words · ${r.sentences} sentences`))),
+    notProof,
+    h("div", { class: "signals" }, r.signals.map((s) => h("div", { class: "signal" },
+      h("span", { class: "signal-name" }, s.name),
+      h("span", { class: "meter", title: `${Math.round(s.score * 100)}% of this signal's maximum` },
+        h("i", { style: `width:${Math.round(s.score * 100)}%` })),
+      h("span", { class: "signal-value" }, `${Math.round(s.weight * 100)}% weight`),
+      h("span", { class: "signal-why" }, `${s.value}. ${s.explanation}`)))),
+    collapsible(`Sentences with AI-style patterns (${r.flagged.length})`, r.flagged.length > 0,
+      h("div", {},
+        h("p", { class: "legend" }, "Hover or long-press a highlight to see why it was flagged."),
+        view)),
+  );
+}
+
+/* ---------- Web source check result ---------- */
+
+const safeLink = (url) => (/^https?:\/\//i.test(url) ? url : null); // never render javascript: or other schemes
+
+function renderWebResult(doc, r) {
+  const found = r.sources.length;
+  const summary = found
+    ? `About ${pct(r.overall)} of this document's fingerprints were found on ${plural(found, "web page")}.`
+    : `No matching pages found for the ${plural(r.queries.length, "phrase")} searched.`;
+
+  const allMatches = h("div", { class: "doc-view", tabindex: "0" });
+  highlight(allMatches, doc.text, r.ranges);
+
+  return h("div", {},
+    h("p", { class: "summary" }, summary),
+    h("p", { class: "meta" },
+      `${plural(r.queries.length, "phrase")} searched · ${plural(r.pages_checked, "page")} checked` +
+      `${r.skipped.length ? ` · ${r.skipped.length} couldn't be read` : ""} · ${(r.elapsed_ms / 1000).toFixed(1)} s`),
+    r.sources.map((s) => sourceCard(doc, s, r)),
+    found ? collapsible("Your document with every match highlighted", false, allMatches) : null,
+    collapsible("What was searched", false,
+      h("ul", { class: "plain-list" }, r.queries.map((q) => h("li", {}, h("code", {}, q.query), ` · ${plural(q.results, "result")}`)))),
+    r.skipped.length ? collapsible("Pages that couldn't be checked", false,
+      h("ul", { class: "plain-list" }, r.skipped.map((s) => h("li", {}, `${s.url} (${s.reason})`)))) : null,
+    h("div", { class: "notice" }, icon("alert"),
+      h("p", {}, "Only pages returned for these phrases were checked. Pages behind logins or paywalls, PDFs and " +
+        "private sources (like other students' submissions) aren't included, so a low result doesn't guarantee " +
+        "the text is original.")),
+  );
+}
+
+function sourceCard(doc, s) {
+  const href = safeLink(s.url);
+  const card = h("article", { class: "pair" });
+  const label = h("span", {}, "Show matches");
+  let view = null;
+  card.append(
+    h("div", { class: "source" },
+      ring(s.score, s.score >= 0.4 ? "high" : s.score >= 0.15 ? "medium" : "low"),
+      h("div", { class: "pair-info" },
+        href ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }, s.title, icon("external")) : h("b", {}, s.title),
+        h("div", { class: "source-domain" }, `${s.domain} · ${pct(s.score)} of your document found here · ${plural(s.ranges.length, "passage")}`))),
+    h("div", { class: "pair-actions" },
+      h("button", {
+        class: "ghost-btn",
+        onclick: () => {
+          if (view) { view.remove(); view = null; } else {
+            const text = h("div", { class: "doc-view", tabindex: "0" });
+            highlight(text, doc.text, s.ranges);
+            view = h("div", { class: "viewer" }, h("div", { class: "viewer-bar" }, `Passages from your document found on ${s.domain}`),
+              h("div", { style: "padding:0 14px 12px;background:var(--surface)" }, text));
+            card.append(view);
+          }
+          label.textContent = view ? "Hide matches" : "Show matches";
+        },
+      }, icon("columns"), label),
+      href ? h("button", { class: "ghost-btn", onclick: () => copyText(href, "Link copied") }, icon("copy"), "Copy link") : null),
+  );
+  return card;
 }
 
 function focusMark(container, index) {
@@ -633,13 +815,23 @@ function updateComposer() {
   const incoming = state.pending.length + typed;
   const total = existing + incoming;
 
-  el.addText.hidden = !typed;
-  el.send.disabled = state.busy || incoming === 0 || total < 2;
+  el.addText.hidden = !typed || state.mode !== "compare";
   el.docCount.textContent = incoming ? plural(incoming, "new document") : "";
 
-  if (conv) el.hint.textContent = `New documents are compared with the ${plural(existing, "document")} already in this check · Ctrl+Enter to compare`;
-  else if (total < 2) el.hint.textContent = `Add at least two documents${total ? " (one more to go)" : ""} · Ctrl+Enter to compare`;
-  else el.hint.textContent = "Ready · Ctrl+Enter to compare";
+  if (state.mode === "compare") {
+    el.send.disabled = state.busy || incoming === 0 || total < 2;
+    if (conv) el.hint.textContent = `New documents are compared with the ${plural(existing, "document")} already in this check · Ctrl+Enter to compare`;
+    else if (total < 2) el.hint.textContent = `Add at least two documents${total ? " (one more to go)" : ""} · Ctrl+Enter to compare`;
+    else el.hint.textContent = "Ready · Ctrl+Enter to compare";
+    return;
+  }
+  // AI and web checks look at exactly one document.
+  const webBlocked = state.mode === "web" && !state.webSearch;
+  el.send.disabled = state.busy || incoming !== 1 || webBlocked;
+  if (incoming > 1) el.hint.textContent = `${MODES[state.mode].title} works on one document at a time. Remove ${incoming - 1}.`;
+  else if (webBlocked) el.hint.textContent = "Web check needs a Brave Search API key. Open \"How it works\" for setup.";
+  else if (state.mode === "ai") el.hint.textContent = "An estimate of AI-style patterns, not proof · runs on this computer · Ctrl+Enter";
+  else el.hint.textContent = "Sends up to 8 short phrases from your document to Brave Search · Ctrl+Enter";
 }
 
 function autosize() {
@@ -663,10 +855,12 @@ async function send() {
   const added = state.pending.map(({ name, text }) => ({ name, text }));
   if (!added.length) return;
 
+  const kind = state.mode;
   let conv = current();
   const existing = conv ? conv.documents : [];
   const limit = state.limits?.max_documents ?? 50;
-  if (existing.length + added.length < 2) return toast("Add at least two documents to compare.", "error");
+  if (kind !== "compare" && added.length !== 1) return toast(`${MODES[kind].title} works on one document at a time.`, "error");
+  if (kind === "compare" && existing.length + added.length < 2) return toast("Add at least two documents to compare.", "error");
   if (existing.length + added.length > limit) return toast(`A check can hold up to ${limit} documents.`, "error");
 
   if (!conv) {
@@ -676,7 +870,7 @@ async function send() {
   conv.documents = [...existing, ...added];
   conv.title = makeTitle(conv.documents);
   const turn = {
-    at: Date.now(), addedCount: added.length, docCount: conv.documents.length,
+    kind, at: Date.now(), addedCount: added.length, docCount: conv.documents.length,
     k: state.settings.k, w: state.settings.w, result: null, error: null,
   };
   conv.turns.push(turn);
@@ -692,11 +886,18 @@ async function runTurn(conv, turn) {
   conv.updated = Date.now();
   state.busy = true;
   render();
+  const kind = MODES[turn.kind] ? turn.kind : "compare";
+  const target = conv.documents[turn.docCount - 1]; // AI and web checks look at the document they added
+  const request = {
+    compare: ["/api/compare", { documents: conv.documents.slice(0, turn.docCount), k: turn.k, w: turn.w }],
+    ai: ["/api/ai-check", { text: target.text }],
+    web: ["/api/web-check", { text: target.text }],
+  }[kind];
   try {
-    const response = await fetch("/api/compare", {
+    const response = await fetch(request[0], {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ documents: conv.documents.slice(0, turn.docCount), k: turn.k, w: turn.w }),
+      body: JSON.stringify(request[1]),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
@@ -719,6 +920,7 @@ async function runSamples() {
     if (!Array.isArray(samples) || samples.length < 2) throw new Error();
     state.currentId = null;
     state.pending = [];
+    setMode("compare");
     samples.forEach((s) => addPending(s.name, s.text));
     await send();
   } catch {
@@ -726,8 +928,25 @@ async function runSamples() {
   }
 }
 
-function showHelp() {
-  openDialog("How simcheck works",
+async function runAiSample() {
+  try {
+    const samples = await (await fetch("/api/samples?set=ai")).json();
+    const sample = samples.find((s) => s.name === "ai_style.txt") || samples[0];
+    if (!sample) throw new Error();
+    state.currentId = null;
+    state.pending = [];
+    setMode("ai");
+    addPending(sample.name, sample.text);
+    await send();
+  } catch {
+    toast("Couldn't load the sample document.", "error");
+  }
+}
+
+function showHelp(section) {
+  toggleModeMenu(false);
+  const compare = [
+    h("h3", {}, "Compare documents"),
     h("ol", {},
       h("li", {}, h("b", {}, "Words. "), "Each document is lowercased and split into words, ignoring punctuation."),
       h("li", {}, h("b", {}, "k-grams. "), "Every run of k words in a row (default 5) is turned into a number with a hash function."),
@@ -735,9 +954,34 @@ function showHelp() {
         "Any shared run of k + w − 1 words is guaranteed to produce a shared fingerprint."),
       h("li", {}, h("b", {}, "Scores. "), "Shared fingerprints give the scores: how much of A appears in B, the reverse, and the Jaccard overlap of both."),
       h("li", {}, h("b", {}, "Passages. "), "Shared fingerprints are mapped back to the original text and highlighted.")),
-    h("p", {}, "Everything runs on this computer. Checks are saved only in this browser. ",
-      "Fingerprinting finds copied wording; it can't detect paraphrasing."),
-    h("p", {}, "Algorithm: Schleimer, Wilkerson & Aiken, ", h("i", {}, "Winnowing: Local Algorithms for Document Fingerprinting"), " (2003)."));
+    h("p", {}, "Fingerprinting finds copied wording; it can't detect paraphrasing. Algorithm: Schleimer, Wilkerson & Aiken, ",
+      h("i", {}, "Winnowing: Local Algorithms for Document Fingerprinting"), " (2003)."),
+  ];
+  const ai = [
+    h("h3", {}, "AI-writing check"),
+    h("p", {}, "Measures five patterns that AI assistants produce more often than most people: evenly sized sentences, ",
+      "overused words (\"delve\", \"pivotal\"…), stock transitions (\"Furthermore\"…), three-part lists and em dashes. ",
+      "Each is scored 0–1, weighted, and combined into a score out of 100. It needs at least 150 words."),
+    h("p", {}, h("b", {}, "It is not proof. "), "No AI detector, including commercial ones, can prove who wrote a text. ",
+      "Formal and non-native English writing often scores high; edited AI text can score low. Runs entirely on this computer."),
+  ];
+  const web = [
+    h("h3", {}, "Web source check"),
+    h("p", {}, "Picks up to 8 distinctive phrases from your document, searches for each as an exact quote with the ",
+      "Brave Search API, downloads up to 12 of the pages found, and fingerprints them like a comparison. ",
+      "Those phrases are sent to Brave; nothing else leaves your computer."),
+    h("p", {}, h("b", {}, "Setup: "), state.webSearch ? "a key is configured, so web check is ready." : "web check is off until you add a key."),
+    h("ol", {},
+      h("li", {}, "Create a Brave Search API account at api-dashboard.search.brave.com (needs a card; the plan includes monthly free credit). Set a spending limit if you want to stay within the free credit."),
+      h("li", {}, "Copy your API key. Keep it private: don't paste it into chats or commit it to GitHub."),
+      h("li", {}, "In PowerShell, save it for your user account: ", h("code", {}, "setx BRAVE_SEARCH_API_KEY \"your-key\"")),
+      h("li", {}, "Open a new terminal and restart the server: ", h("code", {}, ".venv\\Scripts\\python -m simcheck.web"))),
+  ];
+  const sections = { compare, ai, web };
+  const order = section && sections[section] ? [section, ...Object.keys(sections).filter((s) => s !== section)] : Object.keys(sections);
+  openDialog("How simcheck works",
+    ...order.flatMap((s) => sections[s]),
+    h("p", {}, "Checks are saved only in this browser."));
 }
 
 /* ============================================================
@@ -750,7 +994,11 @@ function bindEvents() {
   $("#collapse").onclick = () => setSidebar(false);
   $("#open-sidebar").onclick = () => setSidebar(true);
   $("#backdrop").onclick = () => setSidebar(false);
-  $("#help").onclick = showHelp;
+  $("#help").onclick = () => showHelp();
+  el.modeBtn.onclick = () => toggleModeMenu();
+  document.addEventListener("click", (e) => {
+    if (!el.modeMenu.hidden && !el.modeMenu.contains(e.target) && !el.modeBtn.contains(e.target)) toggleModeMenu(false);
+  });
   $("#dialog-close").onclick = () => el.dialog.close();
   el.dialog.addEventListener("click", (e) => { if (e.target === el.dialog) el.dialog.close(); });
 
@@ -784,6 +1032,7 @@ function bindEvents() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       toggleSettings(false);
+      toggleModeMenu(false);
       if (isMobile()) setSidebar(false);
     }
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); newCheck(); }
@@ -808,7 +1057,9 @@ async function loadInfo() {
   try {
     const info = await (await fetch("/api/info")).json();
     state.engine = info.engine;
+    state.webSearch = Boolean(info.web_search);
     state.limits = info;
+    updateComposer();
     el.badge.hidden = false;
     el.badge.textContent = `${info.engine} engine`;
     el.badge.classList.toggle("rust", info.engine === "rust");
@@ -824,6 +1075,7 @@ function init() {
   applyTheme(state.theme);
   if (!isMobile() && store.get(KEYS.sidebar, true) === false) el.app.classList.add("sidebar-collapsed");
   bindEvents();
+  setMode("compare");
   renderSettings();
   renderChips();
   render();
